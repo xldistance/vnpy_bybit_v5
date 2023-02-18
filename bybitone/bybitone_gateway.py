@@ -989,7 +989,7 @@ class BybitWebsocketDataApi(WebsocketClient):
 
         if tick.last_price:
             self.gateway.on_tick(copy(tick))
-#-------------------------------------------------------------------------------------------------
+    #-------------------------------------------------------------------------------------------------
     def on_public_trade(self,packet:dict):
         """
         收到平台成交回报
