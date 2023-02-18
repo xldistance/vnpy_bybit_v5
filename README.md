@@ -4,4 +4,4 @@ bybit v5统一接口
     BYBIT = "BYBIT"             #永续合约
     BYBITSPOT = "BYBITSPOT"             #现货
     
-bybit v5统一接口,现货，期货，期权都可以在一个接口里面交易了
+bybit v5统一接口，现货，期货，期权都可以在一个接口里面交易了
