@@ -363,9 +363,16 @@ class BybitRestApi(RestClient):
     #------------------------------------------------------------------------------------------------- 
     def get_category(self,vt_symbol:str):
         """
-        通过symbol获取产品类型
+        通过vt_symbol获取产品类型
         """
-        category = VT_SYMBOL_CATEGORY_MAP[vt_symbol]
+        category = VT_SYMBOL_CATEGORY_MAP.get(vt_symbol, None)
+        # 产品类型缺失处理
+        if not category:
+            symbol,*_ = extract_vt_symbol(vt_symbol)
+            if symbol.endswith("USDT") or symbol.endswith("PERP"):
+                category = "linear"
+            else:
+                category = "inverse"
         return category
     #-------------------------------------------------------------------------------------------------  
     def set_leverage(self,vt_symbol:str):
