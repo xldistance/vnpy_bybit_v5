@@ -78,8 +78,6 @@ INTERVAL_VT2BYBIT = {
     Interval.DAILY: "D",
     Interval.WEEKLY: "W",
 }
-
-VT_SYMBOL_CATEGORY_MAP:Dict[str,str] = {}
 CATEGORY_EXCHANGE_MAP:Dict[str,Exchange] = {
     "spot":Exchange.BYBITSPOT,
     "inverse":Exchange.BYBIT,
@@ -212,7 +210,7 @@ class BybitOneGateway(BaseGateway):
         处理定时任务
         """
         self.query_account()
-        if self.query_contracts and VT_SYMBOL_CATEGORY_MAP:
+        if self.query_contracts:
             vt_symbol = self.query_contracts.pop(0)
             self.query_order(vt_symbol)
             self.query_position(vt_symbol)
@@ -231,7 +229,7 @@ class BybitOneGateway(BaseGateway):
         """
         查询合约历史数据
         """
-        if self.history_contracts and VT_SYMBOL_CATEGORY_MAP:
+        if self.history_contracts:
             vt_symbol = self.history_contracts.pop(0)
             symbol,exchange,gateway_name = extract_vt_symbol(vt_symbol)
             req = HistoryRequest(
@@ -365,12 +363,14 @@ class BybitRestApi(RestClient):
         """
         通过vt_symbol获取产品类型
         """
-        category = VT_SYMBOL_CATEGORY_MAP.get(vt_symbol, None)
-        # 产品类型缺失处理
-        if not category:
-            symbol,*_ = extract_vt_symbol(vt_symbol)
+        symbol,exchange,gateway_name = extract_vt_symbol(vt_symbol)
+        if exchange == Exchange.BYBITSPOT:
+            category = "spot"
+        else:
             if symbol.endswith("USDT") or symbol.endswith("PERP"):
                 category = "linear"
+            elif symbol.endswith("-C") or symbol.endswith("-P"):
+                category = "option"
             else:
                 category = "inverse"
         return category
@@ -381,13 +381,17 @@ class BybitRestApi(RestClient):
         """
         symbol = extract_vt_symbol(vt_symbol)[0]
         category = self.get_category(vt_symbol)
+        # 现货无法设置杠杆
+        if category == "spot":
+            return
         path = "/v5/position/set-leverage"
-        data = {"category":category,"symbol":symbol,"buyLeverage":20,"sellLeverage":20}
-        self.add_request("POST", path,self.on_leverage,data = data,extra=data)
+        data = {"category":category,"symbol":symbol,"buyLeverage":"20","sellLeverage":"20"}
+        self.add_request("POST", path,self.on_leverage,data = data,extra={"vt_symbol":vt_symbol})
     #-------------------------------------------------------------------------------------------------   
     def on_leverage(self, data: dict, request: Request):
         """
-        收到设置杠杆回调
+        * 收到设置杠杆回调
+        * reMsg:110043杠杆没有修改,0杠杆修改成功
         """
         pass
     #-------------------------------------------------------------------------------------------------   
@@ -561,7 +565,6 @@ class BybitRestApi(RestClient):
                 min_volume=float(contract_data["lotSizeFilter"]["minOrderQty"]),
                 gateway_name=self.gateway_name
             )
-            VT_SYMBOL_CATEGORY_MAP[contract.vt_symbol] = category
             self.gateway.on_contract(contract)
         self.gateway.write_log(f"{self.gateway_name}，{category.upper()}合约信息查询成功")
     #-------------------------------------------------------------------------------------------------  
