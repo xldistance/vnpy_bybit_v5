@@ -953,12 +953,11 @@ class BybitWebsocketDataApi(WebsocketClient):
             tick.open_interest = float(data["openInterest"])
             tick.last_price = float(data["lastPrice"])
             tick.volume = float(data["volume24h"])
-
         # snapshot和delta都推送的数据
-        tick.bid_price_1 = float(data["bid1Price"])
-        tick.bid_volume_1 = float(data["bid1Size"])
-        tick.ask_price_1 = float(data["ask1Price"])
-        tick.ask_volume_1 = float(data["ask1Size"])
+        tick.bid_price_1 = float(data["bid1Price"]) if data["bid1Price"] else 0
+        tick.bid_volume_1 = float(data["bid1Size"]) if data["bid1Size"] else 0
+        tick.ask_price_1 = float(data["ask1Price"]) if data["ask1Price"] else 0
+        tick.ask_volume_1 = float(data["ask1Size"]) if data["ask1Size"] else 0
 
         tick.datetime = get_local_datetime(int(timestamp))
     #-------------------------------------------------------------------------------------------------   
