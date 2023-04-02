@@ -554,10 +554,12 @@ class BybitRestApi(RestClient):
         else:
             product = Product.FUTURES
         for contract_data in data["result"]["list"]:
+            delivery_time = int(contract_data["deliveryTime"])  # 交割时间
+            name = str(get_local_datetime(delivery_time).date()) if delivery_time else contract_data["symbol"]
             contract = ContractData(
                 symbol=contract_data["symbol"],
                 exchange=CATEGORY_EXCHANGE_MAP[category],
-                name=contract_data["symbol"],
+                name=name,
                 product=product,
                 size = 20,             #合约杠杆
                 price_tick=float(contract_data["priceFilter"].get("minPrice",contract_data["priceFilter"]["tickSize"])),
