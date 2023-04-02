@@ -554,7 +554,7 @@ class BybitRestApi(RestClient):
         else:
             product = Product.FUTURES
         for contract_data in data["result"]["list"]:
-            delivery_time = int(contract_data["deliveryTime"])  # 交割时间
+            delivery_time = int(contract_data.get("deliveryTime",0))  # 交割时间
             name = str(get_local_datetime(delivery_time).date()) if delivery_time else contract_data["symbol"]
             contract = ContractData(
                 symbol=contract_data["symbol"],
