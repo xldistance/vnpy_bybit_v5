@@ -653,9 +653,6 @@ class BybitRestApi(RestClient):
         raw_data = data["result"]["list"]
         for pos_data in raw_data:
             if category == "inverse":
-                price = float(pos_data["entryPrice"])
-            else:
-                price = float(pos_data["avgPrice"])
             direction = DIRECTION_BYBIT2VT.get(pos_data["side"],None)
             if direction:
                 pos = PositionData(
@@ -663,7 +660,7 @@ class BybitRestApi(RestClient):
                     exchange=exchange,
                     direction=direction,
                     volume=abs(float(pos_data["size"])),
-                    price=price,  
+                    price=float(pos_data["entryPrice"]),
                     pnl = float(pos_data["unrealisedPnl"]),              #持仓盈亏
                     gateway_name=self.gateway_name
                 )
