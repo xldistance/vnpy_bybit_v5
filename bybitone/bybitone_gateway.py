@@ -483,7 +483,7 @@ class BybitRestApi(RestClient):
         
         data = {
             "category":self.get_category(req.vt_symbol),
-            "orderId": sys_orderid,
+            "orderLinkId":req.orderid,
             "symbol": req.symbol,
         }
 
