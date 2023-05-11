@@ -574,9 +574,11 @@ class BybitRestApi(RestClient):
         """
         发送查询资金请求
         """
-        params = [{"accountType":"UNIFIED"},{"accountType":"CONTRACT"}]
+        params = ["UNIFIED","CONTRACT"]
         for param in params:
-             self.add_request(method ="GET", path = "/v5/account/wallet-balance", callback = self.on_query_account,params = param)
+             self.add_request(
+                 method ="GET", path = "/v5/account/wallet-balance", callback = self.on_query_account,params = {"accountType":param}
+                 )
     #------------------------------------------------------------------------------------------------- 
     def on_query_account(self,data: dict, request: Request):
         """
