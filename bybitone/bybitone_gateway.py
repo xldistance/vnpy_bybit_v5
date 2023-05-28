@@ -530,10 +530,9 @@ class BybitRestApi(RestClient):
     def query_contract(self):
         """
         """
-        params = [{"category":"linear"},{"category":"inverse"},{"category":"spot"}]
+        params = ["linear","inverse","spot"]
         for param in params:
-            param.update({"limit":1000})
-            self.add_request( "GET", "/v5/market/instruments-info", self.on_query_contract,param)
+            self.add_request( "GET", "/v5/market/instruments-info", self.on_query_contract,params = {"limit":1000,"status":"Trading","category":param})
     #-------------------------------------------------------------------------------------------------   
     def check_error(self, name: str, data: dict):
         """
