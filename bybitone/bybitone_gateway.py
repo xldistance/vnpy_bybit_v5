@@ -6,6 +6,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timedelta
 from time import time
+from threading import Lock
 from typing import Any, Dict, List, Callable
 from urllib.parse import urlencode
 from copy import copy
@@ -101,7 +102,8 @@ TESTNET_PRIVATE_WS_HOST = "wss://stream-testnet.bybit.com/v5/private"  #主网�
 #-------------------------------------------------------------------------------------------------   
 class BybitOneGateway(BaseGateway):
     """
-    BYBIT统一账户接口
+    * BYBIT统一账户接口
+    * BYBIT接口不订阅深度数据，防止交易进程过载堵塞行情
     """
     #default_setting由vnpy.trader.ui.widget调用
     default_setting = {
@@ -121,8 +123,6 @@ class BybitOneGateway(BaseGateway):
         """
         super().__init__(event_engine, "BYBITONE")
         self.orders: Dict[str, OrderData] = {}
-        self.connect_time = datetime.now(TZ_INFO).strftime("%y%m%d%H%M%S")
-        self.order_manager = LocalOrderManager(self, self.connect_time)
         self.ws_spot_data_api = BybitWebsocketDataApi(self)
         self.ws_usdt_data_api = BybitWebsocketDataApi(self)
         self.ws_inverse_data_api = BybitWebsocketDataApi(self)
@@ -276,11 +276,14 @@ class BybitRestApi(RestClient):
         super().__init__()
         self.gateway = gateway
         self.gateway_name = gateway.gateway_name
-        self.order_manager = gateway.order_manager
         self.key = ""
         self.secret = b""
         self.account_date = None    #账户日期
         self.accounts_info:Dict[str,dict] = {}
+        # 确保生成的orderid不发生冲突
+        self.order_count: int = 0
+        self.order_count_lock: Lock = Lock()
+        self.connect_time: int = 0
     #-------------------------------------------------------------------------------------------------   
     def get_server_time(self):
         """
@@ -349,6 +352,9 @@ class BybitRestApi(RestClient):
         """
         self.key = key
         self.secret = secret.encode()
+        self.connect_time = (
+            int(datetime.now().strftime("%y%m%d%H%M%S"))
+        )
         if server == "REAL":
             self.init(REST_HOST, proxy_host, proxy_port,proxy_type,gateway_name = self.gateway_name)
         else:
@@ -394,11 +400,19 @@ class BybitRestApi(RestClient):
         * reMsg:110043杠杆没有修改,0杠杆修改成功
         """
         pass
+    #------------------------------------------------------------------------------------------------- 
+    def _new_order_id(self) -> int:
+        """
+        生成本地委托号
+        """
+        with self.order_count_lock:
+            self.order_count += 1
+            return self.order_count
     #-------------------------------------------------------------------------------------------------   
     def send_order(self, req: OrderRequest):
         """
         """
-        orderId = req.symbol + "-" + self.order_manager.new_local_orderid()
+        orderid = req.symbol + "-" + str(self.connect_time + self._new_order_id())
         data = {
             "category":self.get_category(req.vt_symbol),
             "symbol": req.symbol,
@@ -406,7 +420,7 @@ class BybitRestApi(RestClient):
             "qty": str(req.volume),
             "side": DIRECTION_VT2BYBIT[req.direction],
             "orderType":ORDER_TYPE_VT2BYBIT[req.type],
-            "orderLinkId": orderId,
+            "orderLinkId": orderid,
             "positionIdx":"0",              #单向持仓
             "timeInForce": "GTC",
         }
@@ -414,7 +428,7 @@ class BybitRestApi(RestClient):
         if req.offset == Offset.CLOSE:
             data["reduceOnly"] = True
             data["closeOnTrigger"] = True
-        order = req.create_order_data(orderId, self.gateway_name)
+        order = req.create_order_data(orderid, self.gateway_name)
         order.datetime = datetime.now(TZ_INFO)
 
         self.add_request(
@@ -427,7 +441,7 @@ class BybitRestApi(RestClient):
             on_error=self.on_send_order_error,
         )
 
-        self.order_manager.on_order(order)
+        self.gateway.on_order(order)
         return order.vt_orderid
     #-------------------------------------------------------------------------------------------------   
     def on_send_order_failed(self, status_code, request: Request):
@@ -436,7 +450,7 @@ class BybitRestApi(RestClient):
         """
         order = request.extra
         order.status = Status.REJECTED
-        self.order_manager.on_order(order)
+        self.gateway.on_order(order)
         data = request.response.json()
         if not data:
             return
@@ -453,7 +467,7 @@ class BybitRestApi(RestClient):
         """
         order:OrderData = request.extra
         order.status = Status.REJECTED
-        self.order_manager.on_order(order)
+        self.gateway.on_order(order)
 
         # Record exception if not ConnectionError
         if not issubclass(exception_type, ConnectionError):
@@ -465,28 +479,21 @@ class BybitRestApi(RestClient):
         if self.check_error("发送委托", data):
             order:OrderData = request.extra
             order.status = Status.REJECTED
-            self.order_manager.on_order(order)
+            self.gateway.on_order(order)
             self.gateway.write_log(f"错误委托单：{order}")
             return
         orderLinkId = request.extra.orderid
         result = data["result"]
-        self.order_manager.update_orderid_map(
-            orderLinkId,
-            result["orderId"]
-        )
     #-------------------------------------------------------------------------------------------------   
     def cancel_order(self, req: CancelRequest):
         """
         """
         order: OrderData = self.gateway.get_order(req.vt_orderid)
-        sys_orderid = self.order_manager.get_sys_orderid(req.orderid)
-        
         data = {
             "category":self.get_category(req.vt_symbol),
             "orderLinkId":req.orderid,
             "symbol": req.symbol,
         }
-
         self.add_request(
             "POST",
             path="/v5/order/cancel",
@@ -505,7 +512,7 @@ class BybitRestApi(RestClient):
             if error_code == 110001:
                 order: OrderData= request.extra
                 order.status = Status.REJECTED
-                self.order_manager.on_order(order)
+                self.gateway.on_order(order)
             return
     #---------------------------------------------------------------------------------------
     def on_cancel_failed(self, status_code, request: Request) -> None:
@@ -555,13 +562,21 @@ class BybitRestApi(RestClient):
             product = Product.FUTURES
         for contract_data in data["result"]["list"]:
             delivery_time = int(contract_data.get("deliveryTime",0))  # 交割时间
-            name = str(get_local_datetime(delivery_time).date()) if delivery_time else contract_data["symbol"]
+            if delivery_time:
+                delivery_datetime = get_local_datetime(delivery_time)
+                # 过滤过期合约
+                if delivery_datetime <= datetime.now(TZ_INFO):
+                    continue
+                # 交割合约使用交割日期作为name
+                name = str(delivery_datetime.date())
+            else:
+                name = contract_data["symbol"]
             contract = ContractData(
                 symbol=contract_data["symbol"],
                 exchange=CATEGORY_EXCHANGE_MAP[category],
                 name=name,
                 product=product,
-                size = 20,             #合约杠杆
+                size = 1,             #合约杠杆
                 price_tick=float(contract_data["priceFilter"].get("minPrice",contract_data["priceFilter"]["tickSize"])),
                 max_volume = float(contract_data["lotSizeFilter"]["maxOrderQty"]),
                 min_volume=float(contract_data["lotSizeFilter"]["minOrderQty"]),
@@ -609,19 +624,20 @@ class BybitRestApi(RestClient):
             return
         accounts_info = list(self.accounts_info.values())
         account_date = accounts_info[-1]["datetime"].date()
-        account_path = GetFilePath().ctp_account_path.replace("ctp_account_1",self.gateway.account_file_name)
-        for account_data in accounts_info:
-            if not Path(account_path).exists(): # 如果文件不存在，需要写header
-                with open(account_path, 'w',newline="") as f1:          #newline=""不自动换行
-                    w1 = csv.DictWriter(f1, account_data.keys())
-                    w1.writeheader()
-                    w1.writerow(account_data)
-            else: # 文件存在，不需要写header
-                if self.account_date and self.account_date != account_date:        #一天写入一次账户信息         
-                    with open(account_path,'a',newline="") as f1:                               #a二进制追加形式写入
-                        w1 = csv.DictWriter(f1, account_data.keys())
-                        w1.writerow(account_data)
+        account_path = GetFilePath.ctp_account_path.replace("ctp_account_1",self.gateway.account_file_name)
+        write_header = not Path(account_path).exists()
+        additional_writing = self.account_date and self.account_date != account_date
         self.account_date = account_date
+        # 文件不存在则写入文件头，否则只在日期变更后追加写入文件
+        if not write_header and not additional_writing:
+            return
+        write_mode = "w" if write_header else "a"
+        for account_data in accounts_info:
+            with open(account_path, write_mode, newline="") as f1:          
+                w1 = csv.DictWriter(f1, list(account_data))
+                if write_header:
+                    w1.writeheader()
+                w1.writerow(account_data)
     #-------------------------------------------------------------------------------------------------   
     def query_position(self,vt_symbol:str):
         """
@@ -633,10 +649,7 @@ class BybitRestApi(RestClient):
             "limit":50,
             "symbol":symbol
         }
-        if params["category"] == "inverse":
-            path = "/contract/v3/private/position/list"
-        else:
-            path = "/v5/position/list"
+        path = "/v5/position/list"
         self.add_request(method = "GET", path = path, callback = self.on_query_position,params = params)
     #-------------------------------------------------------------------------------------------------   
     def on_query_position(self, data: dict, request: Request):
@@ -644,17 +657,14 @@ class BybitRestApi(RestClient):
         收到持仓回报
         """
         if self.check_error("查询持仓", data):
-            if data["retCode"] == 10001:
-                delete_dr_data(request.params["symbol"],self.gateway_name)
-            elif data["retCode"] == 10002:
-                # 服务器时间与本地时间不同步，重启交易子进程
+            if data["retCode"] == 10002:
+                self.gateway.write_log(f"服务器时间与本地时间不同步，重启交易子进程")
                 save_connection_status(self.gateway_name,False)
             return
         category = data["result"]["category"]
         exchange = CATEGORY_EXCHANGE_MAP[category]
         raw_data = data["result"]["list"]
         for pos_data in raw_data:
-            if category == "inverse":
             direction = DIRECTION_BYBIT2VT.get(pos_data["side"],None)
             if direction:
                 pos = PositionData(
@@ -662,7 +672,7 @@ class BybitRestApi(RestClient):
                     exchange=exchange,
                     direction=direction,
                     volume=abs(float(pos_data["size"])),
-                    price=float(pos_data["entryPrice"]),
+                    price=float(pos_data["avgPrice"]),
                     pnl = float(pos_data["unrealisedPnl"]),              #持仓盈亏
                     gateway_name=self.gateway_name
                 )
@@ -701,10 +711,7 @@ class BybitRestApi(RestClient):
             "limit": 20,
             "symbol":symbol,
         }
-        if params["category"] == "inverse":
-            path = "/contract/v3/private/order/unfilled-orders"
-        else:
-            path = "/v5/order/realtime"
+        path = "/v5/order/realtime"
         self.add_request( "GET", path, callback=self.on_query_order, params=params )
     #-------------------------------------------------------------------------------------------------   
     def on_query_order(self, data: dict, request: Request):
@@ -721,41 +728,22 @@ class BybitRestApi(RestClient):
         category = data["result"]["category"]
         exchange = CATEGORY_EXCHANGE_MAP[category]
         for order_data in result:
-            status = STATUS_BYBIT2VT[order_data["orderStatus"]]
-            sys_orderid = order_data["orderId"]
-            order = self.order_manager.get_order_with_sys_orderid(sys_orderid)
-            if order:
-                order.traded = float(order_data["cumExecQty"])
-                order.status = status
-            else:
-                # Use sys_orderid as local_orderid when
-                # order placed from other source
-                local_orderid = order_data["orderLinkId"]
-                order_datetime = get_local_datetime(int(order_data["createdTime"]))
-                if not local_orderid:
-                    local_orderid = sys_orderid
-
-                self.order_manager.update_orderid_map(
-                    local_orderid,
-                    sys_orderid
-                )
-
-                order = OrderData(
-                    symbol=order_data["symbol"],
-                    exchange=exchange,
-                    orderid=local_orderid,
-                    type=ORDER_TYPE_BYBIT2VT[order_data["orderType"]],
-                    direction=DIRECTION_BYBIT2VT[order_data["side"]],
-                    price=float(order_data["price"]),
-                    volume=float(order_data["qty"]),
-                    traded=float(order_data["cumExecQty"]),
-                    status=status,
-                    datetime= order_datetime,
-                    gateway_name=self.gateway_name
-                )
+            order = OrderData(
+                symbol=order_data["symbol"],
+                exchange=exchange,
+                orderid=order_data["orderLinkId"],
+                type=ORDER_TYPE_BYBIT2VT[order_data["orderType"]],
+                direction=DIRECTION_BYBIT2VT[order_data["side"]],
+                price=float(order_data["price"]),
+                volume=float(order_data["qty"]),
+                traded=float(order_data["cumExecQty"]),
+                status=STATUS_BYBIT2VT[order_data["orderStatus"]],
+                datetime= get_local_datetime(int(order_data["createdTime"])),
+                gateway_name=self.gateway_name
+            )
             if order_data["reduceOnly"]:
                 order.offset = Offset.CLOSE
-            self.order_manager.on_order(order)
+            self.gateway.on_order(order)
     #-------------------------------------------------------------------------------------------------   
     def query_history(self, req: HistoryRequest) -> List[BarData]:
         """
@@ -890,7 +878,7 @@ class BybitWebsocketDataApi(WebsocketClient):
         # 订阅tick行情
         self.subscribe_topic(f"tickers.{req.symbol}", self.on_tick)
         # 订阅1档orderbook深度
-        self.subscribe_topic(f"orderbook.1.{req.symbol}", self.on_depth)
+        #self.subscribe_topic(f"orderbook.1.{req.symbol}", self.on_depth)
         # 订阅成交数据
         self.subscribe_topic(f"publicTrade.{req.symbol}", self.on_public_trade)
     #-------------------------------------------------------------------------------------------------   
@@ -934,6 +922,10 @@ class BybitWebsocketDataApi(WebsocketClient):
                 # 过滤重复订阅错误回报
                 if "already subscribed" in ret_msg:
                     return
+                # 删除已过期合约
+                if "error:handler not found" in ret_msg:
+                    symbol = ret_msg.split(".")[1]
+                    delete_dr_data(symbol,self.gateway_name)
                 self.gateway.write_log(f"交易接口：{self.gateway_name}，Websocket API出错，错误信息：{ret_msg}")
     #-------------------------------------------------------------------------------------------------   
     def on_tick(self, packet: dict):
@@ -946,7 +938,7 @@ class BybitWebsocketDataApi(WebsocketClient):
         timestamp = packet["ts"]
         symbol = topic.replace("tickers.", "")
         tick = self.ticks[symbol]
-        # 收到快照数据推送
+        # 收到快照数据推送(订阅tick数据后只推送一次)
         if type_ == "snapshot":
             tick.high_price = float(data["highPrice24h"])
             tick.low_price = float(data["lowPrice24h"])
@@ -954,6 +946,7 @@ class BybitWebsocketDataApi(WebsocketClient):
             tick.open_interest = float(data["openInterest"])
             tick.last_price = float(data["lastPrice"])
             tick.volume = float(data["volume24h"])
+
         # snapshot和delta都推送的数据
         tick.bid_price_1 = float(data["bid1Price"]) if data["bid1Price"] else 0
         tick.bid_volume_1 = float(data["bid1Size"]) if data["bid1Size"] else 0
@@ -961,6 +954,8 @@ class BybitWebsocketDataApi(WebsocketClient):
         tick.ask_volume_1 = float(data["ask1Size"]) if data["ask1Size"] else 0
 
         tick.datetime = get_local_datetime(int(timestamp))
+        if tick.last_price:
+            self.gateway.on_tick(copy(tick))
     #-------------------------------------------------------------------------------------------------   
     def on_depth(self, packet: dict):
         """
@@ -1019,7 +1014,6 @@ class BybitWebsocketTradeApi(WebsocketClient):
         super().__init__()
         self.gateway = gateway
         self.gateway_name = gateway.gateway_name
-        self.order_manager = gateway.order_manager
 
         self.key = ""
         self.secret = b""
@@ -1134,41 +1128,22 @@ class BybitWebsocketTradeApi(WebsocketClient):
         for order_data in packet["data"]:
             category = order_data["category"]
             exchange = CATEGORY_EXCHANGE_MAP[category]
-            sys_orderid = order_data["orderId"]
-            order = self.order_manager.get_order_with_sys_orderid(sys_orderid)
-
-            if order:
-                order.traded = float(order_data["cumExecQty"])
-                order.status = STATUS_BYBIT2VT[order_data["orderStatus"]]
-            else:
-                # Use sys_orderid as local_orderid when
-                # order placed from other source
-                local_orderid = order_data["orderLinkId"]
-                order_datetime = get_local_datetime(int(order_data["createdTime"]))
-                if not local_orderid:
-                    local_orderid = sys_orderid
-
-                self.order_manager.update_orderid_map(
-                    local_orderid,
-                    sys_orderid
-                )
-
-                order = OrderData(
-                    symbol=order_data["symbol"],
-                    exchange=exchange,
-                    orderid=local_orderid,
-                    type=ORDER_TYPE_BYBIT2VT[order_data["orderType"]],
-                    direction=DIRECTION_BYBIT2VT[order_data["side"]],
-                    price=float(order_data["price"]),
-                    volume=float(order_data["qty"]),
-                    traded=float(order_data["cumExecQty"]),
-                    status=STATUS_BYBIT2VT[order_data["orderStatus"]],
-                    datetime= order_datetime,
-                    gateway_name=self.gateway_name
-                )
+            order = OrderData(
+                symbol=order_data["symbol"],
+                exchange=exchange,
+                orderid=order_data["orderLinkId"],
+                type=ORDER_TYPE_BYBIT2VT[order_data["orderType"]],
+                direction=DIRECTION_BYBIT2VT[order_data["side"]],
+                price=float(order_data["price"]),
+                volume=float(order_data["qty"]),
+                traded=float(order_data["cumExecQty"]),
+                status=STATUS_BYBIT2VT[order_data["orderStatus"]],
+                datetime= get_local_datetime(int(order_data["createdTime"])),
+                gateway_name=self.gateway_name
+            )
             if order_data["reduceOnly"]:
                 order.offset = Offset.CLOSE
-            self.order_manager.on_order(order)
+            self.gateway.on_order(order)
     #-------------------------------------------------------------------------------------------------   
     def on_position(self, packet):
         """
