@@ -103,7 +103,6 @@ TESTNET_PRIVATE_WS_HOST = "wss://stream-testnet.bybit.com/v5/private"  #主网�
 class BybitOneGateway(BaseGateway):
     """
     * BYBIT统一账户接口
-    * BYBIT接口不订阅深度数据，防止交易进程过载堵塞行情
     """
     #default_setting由vnpy.trader.ui.widget调用
     default_setting = {
@@ -876,8 +875,8 @@ class BybitWebsocketDataApi(WebsocketClient):
         self.ticks[req.symbol] = tick
         # 订阅tick行情
         self.subscribe_topic(f"tickers.{req.symbol}", self.on_tick)
-        # 订阅1档orderbook深度
-        #self.subscribe_topic(f"orderbook.1.{req.symbol}", self.on_depth)
+        # 订阅50档orderbook深度
+        self.subscribe_topic(f"orderbook.50.{req.symbol}", self.on_depth)
         # 订阅成交数据
         self.subscribe_topic(f"publicTrade.{req.symbol}", self.on_public_trade)
     #-------------------------------------------------------------------------------------------------   
