@@ -137,6 +137,16 @@ class BybitOneGateway(BaseGateway):
         self.query_contracts = [vt_symbol for vt_symbol in GetFilePath.all_trading_vt_symbols if extract_vt_symbol(vt_symbol)[2] == self.gateway_name and not extract_vt_symbol(vt_symbol)[0].endswith("99")]
         if not self.query_contracts:
             self.query_contracts = copy(self.recording_list)
+        # 下载历史数据状态
+        self.history_status:bool = True
+
+        self.websocket_apis = [
+            self.ws_spot_data_api,
+            self.ws_usdt_data_api,
+            self.ws_inverse_data_api,
+            self.ws_option_data_api,
+            self.ws_trade_api
+        ]
     #-------------------------------------------------------------------------------------------------   
     def connect(self,log_account:dict = {}):
         """
@@ -164,7 +174,8 @@ class BybitOneGateway(BaseGateway):
 
         self.ws_trade_api.connect(key, secret, server, proxy_host, proxy_port,proxy_type)
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
-        self.event_engine.register(EVENT_TIMER, self.query_history)
+        if self.history_status:
+            self.event_engine.register(EVENT_TIMER, self.query_history)
     #-------------------------------------------------------------------------------------------------   
     def subscribe(self, req: SubscribeRequest):
         """
@@ -218,11 +229,8 @@ class BybitOneGateway(BaseGateway):
         if self.count < 20:
             return
         self.count = 0
-        self.ws_spot_data_api.send_packet({"op":"ping"})
-        self.ws_usdt_data_api.send_packet({"op":"ping"})
-        self.ws_inverse_data_api.send_packet({"op":"ping"})
-        self.ws_option_data_api.send_packet({"op":"ping"})
-        self.ws_trade_api.send_packet({"op":"ping"})
+        for api in self.websocket_apis:
+            api.send_packet({"op": "ping"})
     #-------------------------------------------------------------------------------------------------   
     def query_history(self,event):
         """
@@ -240,6 +248,8 @@ class BybitOneGateway(BaseGateway):
             )
             self.rest_api.query_history(req)
             self.rest_api.set_leverage(vt_symbol)
+            self.rest_api.switch_isolated(vt_symbol)
+            self.rest_api.switch_mode(vt_symbol)
     #---------------------------------------------------------------------------------------
     def on_order(self, order: OrderData) -> None:
         """
@@ -258,11 +268,8 @@ class BybitOneGateway(BaseGateway):
         """
         """
         self.rest_api.stop()
-        self.ws_spot_data_api.stop()
-        self.ws_usdt_data_api.stop()
-        self.ws_inverse_data_api.stop()
-        self.ws_option_data_api.stop()
-        self.ws_trade_api.stop()
+        for api in self.websocket_apis:
+            api.stop()
 #-------------------------------------------------------------------------------------------------   
 class BybitRestApi(RestClient):
     """
@@ -309,24 +316,20 @@ class BybitRestApi(RestClient):
         if request.method == "GET":
             api_params = request.params
             if not api_params:
-                api_params = request.params = {}
+                api_params = request.params = ""
             else:
                 api_params = urlencode(api_params)
         else:
             api_params = request.data
             if not api_params:
-                api_params = request.data = {}
+                api_params = json.dumps({})
             else:
                 api_params = json.dumps(api_params)
-                request.data = api_params
+            request.data = api_params
 
         recv_window = str(30 * 1000)
         nonce = generate_timestamp(-20)
-        if not api_params:
-            if request.method == "GET":
-                api_params = ""
-            else:
-                api_params = request.data = json.dumps({})
+
         param_str= str(nonce) + self.key + recv_window + api_params
         signature = hmac.new(self.secret, param_str.encode("utf-8"),hashlib.sha256).hexdigest()
         if request.headers is None:
@@ -397,6 +400,45 @@ class BybitRestApi(RestClient):
         """
         * 收到设置杠杆回调
         * reMsg:110043杠杆没有修改,0杠杆修改成功
+        """
+        pass
+    #------------------------------------------------------------------------------------------------- 
+    def switch_isolated(self,vt_symbol:str):
+        """
+        设置全仓保证金模式，并设置标的杠杆
+        不支持统一账户设置
+        """
+        symbol = extract_vt_symbol(vt_symbol)[0]
+        category = self.get_category(vt_symbol)
+        # 只支持统一账户反向合约，普通账户正反向合约
+        if category not in ["linear","inverse"]:
+            return
+        path = "/v5/position/switch-isolated"
+        data = {"category":category,"symbol":symbol,"tradeMode":0,"buyLeverage":"20","sellLeverage":"20"}
+        self.add_request("POST", path,self.on_isolated,data = data,extra={"vt_symbol":vt_symbol})
+    #------------------------------------------------------------------------------------------------- 
+    def on_isolated(self, data: dict, request: Request):
+        """
+        收到保证金模式回调
+        """
+        pass
+    #------------------------------------------------------------------------------------------------- 
+    def switch_mode(self,vt_symbol:str):
+        """
+        设置单向持仓模式
+        """
+        symbol = extract_vt_symbol(vt_symbol)[0]
+        category = self.get_category(vt_symbol)
+        # 只支持正向永续和反向永续设置持仓模式
+        if category not in ["linear","inverse"]:
+            return
+        path = "/v5/position/switch-mode"
+        data = {"category":category,"symbol":symbol,"mode":0}
+        self.add_request("POST", path,self.on_mode,data = data,extra={"vt_symbol":vt_symbol})
+    #------------------------------------------------------------------------------------------------- 
+    def on_mode(self, data: dict, request: Request):
+        """
+        收到持仓模式回调
         """
         pass
     #------------------------------------------------------------------------------------------------- 
@@ -612,6 +654,7 @@ class BybitRestApi(RestClient):
                 position_profit = float(account_data["unrealisedPnl"]) if account_data["unrealisedPnl"] else 0,
                 close_profit = float(account_data["cumRealisedPnl"]) if account_data["cumRealisedPnl"] else 0,
                 datetime = datetime.now(TZ_INFO),
+                file_name = self.gateway.account_file_name,
                 gateway_name= self.gateway_name
             )
             if account.balance:
@@ -622,7 +665,7 @@ class BybitRestApi(RestClient):
             return
         accounts_info = list(self.accounts_info.values())
         account_date = accounts_info[-1]["datetime"].date()
-        account_path = GetFilePath.ctp_account_path.replace("ctp_account_1",self.gateway.account_file_name)
+        account_path = GetFilePath.ctp_account_path.replace("ctp_account_main",self.gateway.account_file_name)
         write_header = not Path(account_path).exists()
         additional_writing = self.account_date and self.account_date != account_date
         self.account_date = account_date
@@ -641,7 +684,10 @@ class BybitRestApi(RestClient):
         """
         发送查询持仓请求
         """
-        symbol = extract_vt_symbol(vt_symbol)[0]
+        symbol,exchange,gateway_name = extract_vt_symbol(vt_symbol)
+        # 查询持仓不支持现货
+        if exchange == Exchange.BYBITSPOT:
+            return
         params={
             "category":self.get_category(vt_symbol),
             "limit":50,
@@ -748,17 +794,18 @@ class BybitRestApi(RestClient):
         查询历史数据
         """
         history = []
-        count = 200
-        start_time = int(req.start.timestamp())
+        count = 200         # 交易所限制获取分钟bar数量
+        total_count = 200  # 获取分钟bar数量 
+        start_time = req.start
         time_consuming_start = time()
         while True:
-            end_time = get_local_datetime(start_time,8) + timedelta(minutes=200)
+            end_time = start_time + timedelta(minutes=count)
             # Create query params
             params = {
                 "category":self.get_category(req.vt_symbol),
                 "symbol": req.symbol,
                 "interval": INTERVAL_VT2BYBIT[req.interval],
-                "start": start_time * 1000,
+                "start": int(start_time.timestamp()) * 1000,
                 "end":  int(end_time.timestamp()) * 1000,
                 "limit": count
             }
@@ -805,11 +852,11 @@ class BybitRestApi(RestClient):
                     )
                     buf.append(bar)
                 history.extend(buf)
-                # 收集超过200根bar退出循环
-                if len(history) >= 200:
+                # 收集超过total_count根bar退出循环
+                if len(history) >= total_count:
                     break
                 # Update start time
-                start_time = int((datetime.fromtimestamp(start_time) - timedelta(minutes= 200)).timestamp())
+                start_time -= timedelta(minutes= count)
 
         if not history:
             msg = f"未获取到合约：{req.vt_symbol}历史数据"
@@ -875,9 +922,9 @@ class BybitWebsocketDataApi(WebsocketClient):
         self.ticks[req.symbol] = tick
         # 订阅tick行情
         self.subscribe_topic(f"tickers.{req.symbol}", self.on_tick)
-        # 订阅50档orderbook深度
-        self.subscribe_topic(f"orderbook.50.{req.symbol}", self.on_depth)
-        # 订阅成交数据
+        # 订阅200档orderbook深度(现货推送频率200ms，合约推送频率100ms)
+        self.subscribe_topic(f"orderbook.200.{req.symbol}", self.on_depth)
+        # 订阅逐笔成交数据
         self.subscribe_topic(f"publicTrade.{req.symbol}", self.on_public_trade)
     #-------------------------------------------------------------------------------------------------   
     def subscribe_topic(self, topic: str, callback: Callable[[str, dict], Any]):
@@ -989,13 +1036,10 @@ class BybitWebsocketDataApi(WebsocketClient):
         for n,buf in enumerate(sort_asks):
             tick.__setattr__(f"ask_price_{(n + 1)}" , float(buf[0]))
             tick.__setattr__(f"ask_volume_{(n + 1)}", float(buf[1]))
-
-        if tick.last_price:
-            self.gateway.on_tick(copy(tick))
     #-------------------------------------------------------------------------------------------------
     def on_public_trade(self,packet:dict):
         """
-        收到平台成交回报
+        收到逐笔成交回报
         """
         data = packet["data"]
         for trade_data in data:
