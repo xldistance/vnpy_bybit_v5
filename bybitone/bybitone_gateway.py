@@ -76,9 +76,18 @@ OPPOSITE_DIRECTION = {
 
 ORDER_TYPE_VT2BYBIT = {
     OrderType.LIMIT: "Limit",
-    OrderType.MARKET: "Market",
+    OrderType.FAK: "Market",
+    OrderType.FOK: "Market",
 }
-ORDER_TYPE_BYBIT2VT = {v: k for k, v in ORDER_TYPE_VT2BYBIT.items()}
+
+TIMEINFORCE_MAP = {
+    OrderType.LIMIT:"GTC",
+    OrderType.FAK:"IOC",
+    OrderType.FOK:"FOK",
+
+}
+
+ORDER_TYPE_BYBIT2VT = {v: k for k, v in TIMEINFORCE_MAP.items()}
 
 TIMEDELTA_MAP: Dict[Interval, timedelta] = {
     Interval.MINUTE: timedelta(minutes=1),
@@ -107,12 +116,11 @@ TESTNET_USDT_PUBLIC_WS_HOST = "wss://stream-testnet.bybit.com/v5/public/linear" 
 TESTNET_INVERSE_PUBLIC_WS_HOST = "wss://stream-testnet.bybit.com/v5/public/inverse"  # 反向合约主网公共topic地址
 TESTNET_OPTION_PUBLIC_WS_HOST = "wss://stream-testnet.bybit.com/v5/public/option"  # 期权主网公共topic地址
 TESTNET_PRIVATE_WS_HOST = "wss://stream-testnet.bybit.com/v5/private"  # 主网私有topic地址
-
-
 # ----------------------------------------------------------------------------------------------------
 class BybitOneGateway(BaseGateway):
     """
     * BYBIT统一账户接口
+    * 只支持单向持仓
     """
 
     # default_setting由vnpy.trader.ui.widget调用
@@ -140,6 +148,7 @@ class BybitOneGateway(BaseGateway):
         self.ws_trade_api = BybitWebsocketTradeApi(self)
 
         self.count: int = 0
+        self.query_count: int = 0
         self.recording_list = [vt_symbol for vt_symbol in self.recording_list if is_target_contract(vt_symbol, self.gateway_name)]
         # 历史数据合约列表
         self.history_contracts = copy(self.recording_list)
@@ -149,8 +158,10 @@ class BybitOneGateway(BaseGateway):
             self.query_contracts = copy(self.recording_list)
         # 下载历史数据状态
         self.history_status: bool = True
-
+        # 订阅逐笔成交数据状态
+        self.book_trade_status: bool = False
         self.websocket_apis = [self.ws_spot_data_api, self.ws_usdt_data_api, self.ws_inverse_data_api, self.ws_option_data_api, self.ws_trade_api]
+        self.query_func = [self.query_account,self.query_order,self.query_position]
     # ----------------------------------------------------------------------------------------------------
     def connect(self, log_account: dict = {}):
         """ """
@@ -176,6 +187,7 @@ class BybitOneGateway(BaseGateway):
 
         self.ws_trade_api.connect(key, secret, server, proxy_host, proxy_port)
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
+        self.event_engine.register(EVENT_TIMER, self.process_query_function)
         if self.history_status:
             self.event_engine.register(EVENT_TIMER, self.query_history)
     # ----------------------------------------------------------------------------------------------------
@@ -186,9 +198,9 @@ class BybitOneGateway(BaseGateway):
         if exchange == Exchange.BYBITSPOT:
             self.ws_spot_data_api.subscribe(req)
         else:
-            if symbol.endswith("-C") or symbol.endswith("-P"):
+            if symbol.endswith(("-C", "-P")):
                 self.ws_option_data_api.subscribe(req)
-            elif symbol.endswith("PERP") or symbol.endswith("USDT"):
+            elif symbol.endswith(("PERP", "USDT")):
                 self.ws_usdt_data_api.subscribe(req)
             else:
                 self.ws_inverse_data_api.subscribe(req)
@@ -207,7 +219,7 @@ class BybitOneGateway(BaseGateway):
     # ----------------------------------------------------------------------------------------------------
     def query_order(self, vt_symbol: str):
         """
-        查询未成交委托单
+        查询活动委托单
         """
         self.rest_api.query_active_order(vt_symbol)
     # ----------------------------------------------------------------------------------------------------
@@ -217,20 +229,30 @@ class BybitOneGateway(BaseGateway):
         """
         self.rest_api.query_position(vt_symbol)
     # ----------------------------------------------------------------------------------------------------
-    def process_timer_event(self, event):
+    def process_query_function(self,event):
         """
-        处理定时任务
+        轮询查询活动委托单和持仓
         """
-        self.query_account()
+        self.query_count += 1
+        if self.query_count < 5:
+            return
+        self.query_count = 0
         if self.query_contracts:
             vt_symbol = self.query_contracts.pop(0)
             self.query_order(vt_symbol)
             self.query_position(vt_symbol)
             self.query_contracts.append(vt_symbol)
+    # ----------------------------------------------------------------------------------------------------
+    def process_timer_event(self, event):
+        """
+        处理定时任务
+        """
         self.count += 1
         if self.count < 20:
             return
         self.count = 0
+        self.query_account()
+
         for api in self.websocket_apis:
             api.send_packet({"op": "ping"})
     # ----------------------------------------------------------------------------------------------------
@@ -238,6 +260,7 @@ class BybitOneGateway(BaseGateway):
         """
         查询合约历史数据
         """
+
         if self.history_contracts:
             vt_symbol = self.history_contracts.pop(0)
             symbol, exchange, gateway_name = extract_vt_symbol(vt_symbol)
@@ -272,8 +295,6 @@ class BybitOneGateway(BaseGateway):
         self.rest_api.stop()
         for api in self.websocket_apis:
             api.stop()
-
-
 # ----------------------------------------------------------------------------------------------------
 class BybitRestApi(RestClient):
     """
@@ -327,7 +348,7 @@ class BybitRestApi(RestClient):
 
         param_str = nonce + self.key + recv_window + api_params
         signature = hmac.new(self.secret, param_str.encode("utf-8"), hashlib.sha256).hexdigest()
-        if request.headers is None:
+        if not request.headers:
             request.headers = {"Content-Type": "application/json"}
 
         request.headers.update({"X-BAPI-API-KEY": self.key, "X-BAPI-SIGN": signature, "X-BAPI-TIMESTAMP": nonce, "X-BAPI-RECV-WINDOW": recv_window})
@@ -363,15 +384,14 @@ class BybitRestApi(RestClient):
         """
         symbol, exchange, gateway_name = extract_vt_symbol(vt_symbol)
         if exchange == Exchange.BYBITSPOT:
-            category = "spot"
+            return "spot"
+
+        if symbol.endswith(("USDT", "PERP")):
+            return "linear"
+        elif symbol.endswith(("-C", "-P")):
+            return "option"
         else:
-            if symbol.endswith("USDT") or symbol.endswith("PERP"):
-                category = "linear"
-            elif symbol.endswith("-C") or symbol.endswith("-P"):
-                category = "option"
-            else:
-                category = "inverse"
-        return category
+            return "inverse"
     # ----------------------------------------------------------------------------------------------------
     def set_leverage(self, vt_symbol: str):
         """
@@ -441,23 +461,25 @@ class BybitRestApi(RestClient):
             return self.order_count
     # ----------------------------------------------------------------------------------------------------
     def send_order(self, req: OrderRequest):
-        """ """
+        """
+        发送委托单
+        """
+        category = self.get_category(req.vt_symbol)
         orderid = req.symbol + "-" + str(self.connect_time + self._new_order_id())
         data = {
-            "category": self.get_category(req.vt_symbol),
+            "category": category,
             "symbol": req.symbol,
             "price": str(req.price),
             "qty": str(req.volume),
             "side": DIRECTION_VT2BYBIT[req.direction],
             "orderType": ORDER_TYPE_VT2BYBIT[req.type],
             "orderLinkId": orderid,
-            "positionIdx": "0",  # 单向持仓
-            "timeInForce": "GTC",
+            "positionIdx": "0",     # 单向持仓
+            "timeInForce": TIMEINFORCE_MAP[req.type]      # 订单执行策略
         }
-        # 平仓信号仅减仓
-        if req.offset == Offset.CLOSE:
+        # 平仓信号仅减仓，reduceOnly参数不适用于现货
+        if req.offset == Offset.CLOSE and category != "spot":
             data["reduceOnly"] = True
-            data["closeOnTrigger"] = True
         order = req.create_order_data(orderid, self.gateway_name)
         order.datetime = datetime.now(TZ_INFO)
 
@@ -470,7 +492,6 @@ class BybitRestApi(RestClient):
             on_failed=self.on_send_order_failed,
             on_error=self.on_send_order_error,
         )
-
         self.gateway.on_order(order)
         return order.vt_orderid
     # ----------------------------------------------------------------------------------------------------
@@ -509,8 +530,6 @@ class BybitRestApi(RestClient):
             self.gateway.on_order(order)
             self.gateway.write_log(f"错误委托单：{order}")
             return
-        orderLinkId = request.extra.orderid
-        result = data["result"]
     # ----------------------------------------------------------------------------------------------------
     def cancel_order(self, req: CancelRequest):
         """ """
@@ -746,7 +765,7 @@ class BybitRestApi(RestClient):
                 symbol=order_data["symbol"],
                 exchange=exchange,
                 orderid=order_data["orderLinkId"],
-                type=ORDER_TYPE_BYBIT2VT[order_data["orderType"]],
+                type=ORDER_TYPE_BYBIT2VT[order_data["timeInForce"]],
                 direction=DIRECTION_BYBIT2VT[order_data["side"]],
                 price=float(order_data["price"]),
                 volume=float(order_data["qty"]),
@@ -761,15 +780,15 @@ class BybitRestApi(RestClient):
     # ----------------------------------------------------------------------------------------------------
     def query_history(self, req: HistoryRequest) -> List[BarData]:
         """
-        * 查询历史数据
+        查询历史数据
         """
         history = []
         count = 200  # 交易所限制获取分钟bar数量
         start_time = req.start
         time_consuming_start = time()
-        while True:
+
+        while start_time < req.end:
             end_time = start_time + timedelta(minutes=count)
-            # Create query params
             params = {
                 "category": self.get_category(req.vt_symbol),
                 "symbol": req.symbol,
@@ -778,66 +797,55 @@ class BybitRestApi(RestClient):
                 "end": int(end_time.timestamp() * 1000),
                 "limit": count,
             }
-            # Get response from server
+            
             resp = self.request("GET", "/v5/market/kline", params=params)
-            # Break if request failed with other status code
-            if not resp:
-                msg = f"合约：{req.vt_symbol}，获取历史数据失败"
+            if not resp or resp.status_code // 100 != 2:
+                msg = f"合约：{req.vt_symbol}，获取历史数据失败，状态码：{resp.status_code if resp else '无响应'}"
                 self.gateway.write_log(msg)
-                continue
-            elif resp.status_code // 100 != 2:
-                msg = f"合约：{req.vt_symbol}，获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
+                break
+            
+            data = resp.json()
+            if not data or data["retCode"] == 10001 or not data["result"]:
+                msg = f"无法获取合约：{req.vt_symbol}历史数据"
                 self.gateway.write_log(msg)
-                continue
-            else:
-                data = resp.json()
-                if not data:
-                    msg = f"获取合约：{req.vt_symbol}历史数据为空"
-                    self.gateway.write_log(msg)
-                    break
-                elif data["retCode"] == 10001 or not data["result"]:
-                    delete_dr_data(req.symbol, self.gateway_name)
-                    msg = f"无法获取合约：{req.vt_symbol}历史数据"
-                    self.gateway.write_log(msg)
-                    break
-                buf = []
-                for data in data["result"]["list"]:
-                    dt = get_local_datetime(int(data[0]))
-                    bar = BarData(
-                        symbol=req.symbol,
-                        exchange=req.exchange,
-                        datetime=dt,
-                        interval=req.interval,
-                        volume=float(data[5]),
-                        open_price=float(data[1]),
-                        high_price=float(data[2]),
-                        low_price=float(data[3]),
-                        close_price=float(data[4]),
-                        gateway_name=self.gateway_name,
-                    )
-                    buf.append(bar)
-                start_time += timedelta(minutes=count)
-                history.extend(buf)
-                # 已经获取了所有可用的历史数据或者start已经到了请求的终止时间则终止循环
-                if len(buf) < count or start_time >= req.end:
-                    break
+                delete_dr_data(req.symbol, self.gateway_name)
+                break
+
+            buf = [BarData(
+                symbol=req.symbol,
+                exchange=req.exchange,
+                datetime=get_local_datetime(int(d[0])),
+                interval=req.interval,
+                open_price=float(d[1]),
+                high_price=float(d[2]),
+                low_price=float(d[3]),
+                close_price=float(d[4]),
+                volume=float(d[6] if req.symbol.endswith("USD") else d[5]),     # 反向合约币的成交量是成交额，其他合约币的成交量即为币的成交量
+                gateway_name=self.gateway_name,
+            ) for d in data["result"]["list"]]
+            
+            if not buf:
+                break
+            history.extend(buf)
+            start_time += timedelta(minutes=count)
+            if len(buf) < count:
+                break
+
         history.sort(key=lambda x: x.datetime)
-        if not history:
-            msg = f"未获取到合约：{req.vt_symbol}历史数据"
-            self.gateway.write_log(msg)
-            return
-        for bar_data in chunked(history, 10000):  # 分批保存数据
+        if history:
             try:
-                database_manager.save_bar_data(bar_data, False)  # 保存数据到数据库
+                database_manager.save_bar_data(history, False)
             except Exception as err:
-                self.gateway.write_log(f"{err}")
+                self.gateway.write_log(str(err))
                 return
-        time_consuming_end = time()
-        query_time = round(time_consuming_end - time_consuming_start, 3)
-        msg = f"载入{req.vt_symbol}:bar数据，开始时间：{history[0].datetime} ，结束时间： {history[-1].datetime}，数据量：{len(history)}，耗时:{query_time}秒"
-        self.gateway.write_log(msg)
 
-
+            time_consuming_end = time()
+            query_time = round(time_consuming_end - time_consuming_start, 3)
+            msg = f"载入{req.vt_symbol} bar数据，开始时间：{history[0].datetime}，结束时间：{history[-1].datetime}，数据量：{len(history)}，耗时：{query_time}秒"
+            self.gateway.write_log(msg)
+        else:
+            msg = f"未查询到合约：{req.vt_symbol}历史数据，请核实行情连接"
+            self.gateway.write_log(msg)
 # ----------------------------------------------------------------------------------------------------
 class BybitWebsocketDataApi(WebsocketClient):
     """ """
@@ -869,7 +877,7 @@ class BybitWebsocketDataApi(WebsocketClient):
     # ----------------------------------------------------------------------------------------------------
     def subscribe(self, req: SubscribeRequest):
         """
-        Subscribe to tick data update.
+        订阅tick行情
         """
         self.subscribed[req.vt_symbol] = req
 
@@ -877,15 +885,20 @@ class BybitWebsocketDataApi(WebsocketClient):
         self.ticks[req.symbol] = tick
         # 订阅100ms tick行情
         self.subscribe_topic(f"tickers.{req.symbol}", self.on_tick)
-        # 现货合约订阅1档(50档)深度，期权订阅25档深度(现货合约1档10ms，现货合约50档和期权25档推送频率20ms)
+            
+        # 触发订阅逐笔成交状态则订阅成交数据和20ms深度行情否则订阅100ms深度行情
         category = self.gateway.rest_api.get_category(tick.vt_symbol)
-        if category == "option":
-            depth_level = 25
+        is_option = category == "option"
+        
+        if self.gateway.book_trade_status:
+            self.subscribe_topic(f"publicTrade.{req.symbol}", self.on_public_trade)
+            # 推送频率20ms对应订阅档位
+            depth_level = 25 if is_option else 50
         else:
-            depth_level = 50
+            # 推送频率100ms对应订阅档位，合约200档推送频率100ms，现货200档推送频率200ms
+            depth_level = 100 if is_option else 200
+        
         self.subscribe_topic(f"orderbook.{depth_level}.{req.symbol}", self.on_depth)
-        # 订阅逐笔成交数据
-        self.subscribe_topic(f"publicTrade.{req.symbol}", self.on_public_trade)
     # ----------------------------------------------------------------------------------------------------
     def subscribe_topic(self, topic: str, callback: Callable[[str, dict], Any]):
         """
@@ -998,7 +1011,6 @@ class BybitWebsocketDataApi(WebsocketClient):
         sort_asks = sorted(self.order_book_asks[symbol].items(), key=lambda x: float(x[0]))[:5]
         set_tick_attributes(tick, sort_bids, "bid")
         set_tick_attributes(tick, sort_asks, "ask")
-
         # 如果有最新价格，触发tick更新
         if tick.last_price:
             self.gateway.on_tick(copy(tick))
@@ -1134,7 +1146,7 @@ class BybitWebsocketTradeApi(WebsocketClient):
                 symbol=order_data["symbol"],
                 exchange=exchange,
                 orderid=order_data["orderLinkId"],
-                type=ORDER_TYPE_BYBIT2VT[order_data["orderType"]],
+                type=ORDER_TYPE_BYBIT2VT[order_data["timeInForce"]],
                 direction=DIRECTION_BYBIT2VT[order_data["side"]],
                 price=float(order_data["price"]),
                 volume=float(order_data["qty"]),
@@ -1192,8 +1204,6 @@ class BybitWebsocketTradeApi(WebsocketClient):
                 )
                 self.gateway.on_position(long_position)
                 self.gateway.on_position(short_position)
-
-
 # ----------------------------------------------------------------------------------------------------
 def generate_timestamp(expire_after: float = 30) -> int:
     """
@@ -1201,8 +1211,6 @@ def generate_timestamp(expire_after: float = 30) -> int:
     :return: timestamp in milliseconds
     """
     return int(time() * 1000 + expire_after * 1000)
-
-
 # ----------------------------------------------------------------------------------------------------
 def sign(secret: bytes, data: bytes) -> str:
     """
