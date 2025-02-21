@@ -161,7 +161,6 @@ class BybitOneGateway(BaseGateway):
         # 订阅逐笔成交数据状态
         self.book_trade_status: bool = False
         self.websocket_apis = [self.ws_spot_data_api, self.ws_usdt_data_api, self.ws_inverse_data_api, self.ws_option_data_api, self.ws_trade_api]
-        self.query_func = [self.query_account,self.query_order,self.query_position]
     # ----------------------------------------------------------------------------------------------------
     def connect(self, log_account: dict = {}):
         """ """
@@ -187,20 +186,20 @@ class BybitOneGateway(BaseGateway):
 
         self.ws_trade_api.connect(key, secret, server, proxy_host, proxy_port)
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
-        self.event_engine.register(EVENT_TIMER, self.process_query_function)
+        self.event_engine.register(EVENT_TIMER, self.process_query_functions)
         if self.history_status:
             self.event_engine.register(EVENT_TIMER, self.query_history)
     # ----------------------------------------------------------------------------------------------------
     def subscribe(self, req: SubscribeRequest):
         """ """
-        symbol = req.symbol
         exchange = req.exchange
         if exchange == Exchange.BYBITSPOT:
             self.ws_spot_data_api.subscribe(req)
         else:
-            if symbol.endswith(("-C", "-P")):
+            category = self.rest_api.get_category(req.vt_symbol)
+            if category == "option":
                 self.ws_option_data_api.subscribe(req)
-            elif symbol.endswith(("PERP", "USDT")):
+            elif category == "linear":
                 self.ws_usdt_data_api.subscribe(req)
             else:
                 self.ws_inverse_data_api.subscribe(req)
@@ -229,7 +228,7 @@ class BybitOneGateway(BaseGateway):
         """
         self.rest_api.query_position(vt_symbol)
     # ----------------------------------------------------------------------------------------------------
-    def process_query_function(self,event):
+    def process_query_functions(self,event):
         """
         轮询查询活动委托单和持仓
         """
@@ -385,8 +384,8 @@ class BybitRestApi(RestClient):
         symbol, exchange, gateway_name = extract_vt_symbol(vt_symbol)
         if exchange == Exchange.BYBITSPOT:
             return "spot"
-
-        if symbol.endswith(("USDT", "PERP")):
+        # SOLUSDT-11APR25 U本位交割合约，BTCUSDZ25 币本位交割合约
+        if symbol.endswith(("USDT", "PERP")) or "-" in symbol:
             return "linear"
         elif symbol.endswith(("-C", "-P")):
             return "option"
@@ -642,7 +641,7 @@ class BybitRestApi(RestClient):
             account = AccountData(
                 accountid=f"{coin}_{self.gateway_name}",
                 balance=float(account_data["walletBalance"]),
-                available=float(account_data["availableToWithdraw"]),
+                available=float(account_data["availableToWithdraw"]) if account_data["availableToWithdraw"] else 0,
                 margin=float(account_data["totalPositionIM"]) if account_data["totalPositionIM"] else 0,
                 position_profit=float(account_data["unrealisedPnl"]) if account_data["unrealisedPnl"] else 0,
                 close_profit=float(account_data["cumRealisedPnl"]) if account_data["cumRealisedPnl"] else 0,
@@ -691,7 +690,7 @@ class BybitRestApi(RestClient):
         """
         if self.check_error("查询持仓", data):
             if data["retCode"] == 10002:
-                self.gateway.write_log(f"服务器时间与本地时间不同步，重启交易子进程")
+                self.gateway.write_log(f"交易接口：{self.gateway_name}，服务器时间与本地时间不同步，重启交易子进程")
                 save_connection_status(self.gateway_name, False)
             return
         category = data["result"]["category"]
