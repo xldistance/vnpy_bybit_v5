@@ -342,8 +342,10 @@ class BybitRestApi(RestClient):
             api_params = json.dumps(request.data if request.data else {})
             request.data = api_params
 
-        recv_window = str(30 * 1000)
-        nonce = str(generate_timestamp(-20))
+        #recv_window = str(30 * 1000)
+        #nonce = str(generate_timestamp(-20))
+        recv_window = str(5 * 1000)
+        nonce = str(generate_timestamp(0))
 
         param_str = nonce + self.key + recv_window + api_params
         signature = hmac.new(self.secret, param_str.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -385,7 +387,7 @@ class BybitRestApi(RestClient):
         if exchange == Exchange.BYBITSPOT:
             return "spot"
         # SOLUSDT-11APR25 U本位交割合约，BTCUSDZ25 币本位交割合约
-        if symbol.endswith(("USDT", "PERP")) or "-" in symbol:
+        if symbol.endswith(("USDT", "PERP")) or ("-" in symbol and symbol[-2:].isdigit()):
             return "linear"
         elif symbol.endswith(("-C", "-P")):
             return "option"
@@ -610,7 +612,7 @@ class BybitRestApi(RestClient):
                 exchange=CATEGORY_EXCHANGE_MAP[category],
                 name=name,
                 product=product,
-                size=1,  # 合约杠杆
+                size=20,  # 合约杠杆
                 price_tick=float(contract_data["priceFilter"].get("minPrice", contract_data["priceFilter"]["tickSize"])),
                 max_volume=float(contract_data["lotSizeFilter"]["maxOrderQty"]),
                 min_volume=float(contract_data["lotSizeFilter"]["minOrderQty"]),
@@ -619,13 +621,17 @@ class BybitRestApi(RestClient):
             self.gateway.on_contract(contract)
         self.gateway.write_log(f"{self.gateway_name}，{category.upper()}合约信息查询成功")
     # ----------------------------------------------------------------------------------------------------
+    def get_float_value(self, value: str) -> float:
+        """
+        将字符串转换为浮点数，处理空值
+        """
+        return float(value) if value else 0
+    # ----------------------------------------------------------------------------------------------------
     def query_account(self):
         """
         发送查询资金请求
         """
-        params = ["UNIFIED", "CONTRACT"]
-        for param in params:
-            self.add_request(method="GET", path="/v5/account/wallet-balance", callback=self.on_query_account, params={"accountType": param})
+        self.add_request(method="GET", path="/v5/account/wallet-balance", callback=self.on_query_account, params={"accountType": "UNIFIED"})
     # ----------------------------------------------------------------------------------------------------
     def on_query_account(self, data: dict, request: Request):
         """
@@ -640,15 +646,17 @@ class BybitRestApi(RestClient):
             coin = account_data["coin"]
             account = AccountData(
                 accountid=f"{coin}_{self.gateway_name}",
-                balance=float(account_data["walletBalance"]),
-                available=float(account_data["availableToWithdraw"]) if account_data["availableToWithdraw"] else 0,
-                margin=float(account_data["totalPositionIM"]) if account_data["totalPositionIM"] else 0,
-                position_profit=float(account_data["unrealisedPnl"]) if account_data["unrealisedPnl"] else 0,
-                close_profit=float(account_data["cumRealisedPnl"]) if account_data["cumRealisedPnl"] else 0,
+                balance=self.get_float_value(account_data["walletBalance"]),
+                margin=self.get_float_value(account_data["totalPositionIM"]),
+                position_profit=self.get_float_value(account_data["unrealisedPnl"]),
+                close_profit=self.get_float_value(account_data["cumRealisedPnl"]),
                 datetime=datetime.now(TZ_INFO),
                 file_name=self.gateway.account_file_name,
                 gateway_name=self.gateway_name,
             )
+            total_order_margin = self.get_float_value(account_data["totalOrderIM"])     # 委托单占用保证金.
+            locked = self.get_float_value(account_data["locked"])     # 现货挂单冻结金额
+            account.available = account.balance - account.margin - total_order_margin - locked
             if account.balance:
                 self.gateway.on_account(account)
                 # 保存账户资金信息
@@ -1062,7 +1070,8 @@ class BybitWebsocketTradeApi(WebsocketClient):
     # ----------------------------------------------------------------------------------------------------
     def login(self):
         """ """
-        expires = generate_timestamp(20)
+        #expires = generate_timestamp(20)
+        expires = generate_timestamp(0)
         msg = f"GET/realtime{int(expires)}"
         signature = sign(self.secret, msg.encode())
 
@@ -1075,7 +1084,8 @@ class BybitWebsocketTradeApi(WebsocketClient):
         """
         self.gateway.write_log(f"交易接口:{self.gateway_name},Websocket API登录成功")
         self.subscribe_topic("order", self.on_order)
-        self.subscribe_topic("execution", self.on_trade)
+        #self.subscribe_topic("execution", self.on_trade)       # 全品种成交推送
+        self.subscribe_topic("execution.fast", self.on_trade)       # 不支持期权
         self.subscribe_topic("position", self.on_position)
     # ----------------------------------------------------------------------------------------------------
     def subscribe_topic(self, topic: str, callback: Callable[[str, dict], Any]):
@@ -1206,8 +1216,16 @@ class BybitWebsocketTradeApi(WebsocketClient):
 # ----------------------------------------------------------------------------------------------------
 def generate_timestamp(expire_after: float = 30) -> int:
     """
-    :param expire_after: expires in seconds.
-    :return: timestamp in milliseconds
+    生成一个带有过期时间的时间戳，常用于API请求的身份验证。
+    
+    该函数返回一个以毫秒为单位的时间戳，表示当前时间加上指定的过期时间后的时刻。
+    这个时间戳通常用于API请求中，以确保请求在一定时间内有效。
+    
+    参数:
+        expire_after: float, 过期时间，单位为秒，默认值为30秒。
+    
+    返回:
+        timestamp: int, 以毫秒为单位的时间戳，表示当前时间加上过期时间后的时刻。
     """
     return int(time() * 1000 + expire_after * 1000)
 # ----------------------------------------------------------------------------------------------------
