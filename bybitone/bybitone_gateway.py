@@ -7,7 +7,7 @@ from copy import copy
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from time import time
+from time import time,sleep
 from typing import Any, Callable, Dict, List
 from urllib.parse import urlencode
 
@@ -232,10 +232,10 @@ class BybitOneGateway(BaseGateway):
         """
         轮询查询活动委托单和持仓
         """
-        self.query_count += 1
-        if self.query_count < 5:
-            return
-        self.query_count = 0
+        #self.query_count += 1
+        #if self.query_count < 5:
+            #return
+        #self.query_count = 0
         if self.query_contracts:
             vt_symbol = self.query_contracts.pop(0)
             self.query_order(vt_symbol)
@@ -313,6 +313,7 @@ class BybitRestApi(RestClient):
         self.order_count: int = 0
         self.order_count_lock: Lock = Lock()
         self.connect_time: int = 0
+        self.time_offset:int = 0        # 本地与服务器的毫秒时间差整数值
     # ----------------------------------------------------------------------------------------------------
     def get_server_time(self):
         """
@@ -330,6 +331,7 @@ class BybitRestApi(RestClient):
         """
         server_time = get_local_datetime(int(data["result"]["timeNano"]))
         local_time = datetime.now(TZ_INFO)
+        self.time_offset = int((local_time - server_time).total_seconds() * 1000)
         self.gateway.write_log(f"服务器时间：{server_time}，本地时间：{local_time}")
     # ----------------------------------------------------------------------------------------------------
     def sign(self, request: Request):
@@ -342,11 +344,8 @@ class BybitRestApi(RestClient):
             api_params = json.dumps(request.data if request.data else {})
             request.data = api_params
 
-        #recv_window = str(30 * 1000)
-        #nonce = str(generate_timestamp(-20))
-        recv_window = str(5 * 1000)
-        nonce = str(generate_timestamp(0))
-
+        recv_window = str(30 * 1000)
+        nonce = str(int(time() * 1000) - self.time_offset)
         param_str = nonce + self.key + recv_window + api_params
         signature = hmac.new(self.secret, param_str.encode("utf-8"), hashlib.sha256).hexdigest()
         if not request.headers:
@@ -404,7 +403,7 @@ class BybitRestApi(RestClient):
         if category == "spot":
             return
         path = "/v5/position/set-leverage"
-        data = {"category": category, "symbol": symbol, "buyLeverage": "20", "sellLeverage": "20"}
+        data = {"category": category, "symbol": symbol, "buyLeverage": "10", "sellLeverage": "10"}
         self.add_request("POST", path, self.on_leverage, data=data, extra={"vt_symbol": vt_symbol})
     # ----------------------------------------------------------------------------------------------------
     def on_leverage(self, data: dict, request: Request):
@@ -513,7 +512,7 @@ class BybitRestApi(RestClient):
     # ----------------------------------------------------------------------------------------------------
     def on_send_order_error(self, exception_type: type, exception_value: Exception, tracebacks, request: Request):
         """
-        Callback when sending order caused exception.
+        订单发送异常处理回调函数
         """
         order: OrderData = request.extra
         order.status = Status.REJECTED
@@ -570,7 +569,7 @@ class BybitRestApi(RestClient):
         # params = ["linear", "inverse", "spot","option"]
         params = ["linear", "inverse", "spot"]
         for param in params:
-            self.add_request("GET", "/v5/market/instruments-info", self.on_query_contract, params={"limit": 1000, "status": "Trading", "category": param})
+            self.add_request("GET", "/v5/market/instruments-info", self.on_query_contract, params={"limit": 500, "status": "Trading", "category": param})
     # ----------------------------------------------------------------------------------------------------
     def check_error(self, name: str, data: dict):
         """ """
@@ -597,27 +596,25 @@ class BybitRestApi(RestClient):
         else:
             product = Product.FUTURES
         for contract_data in data["result"]["list"]:
-            delivery_time = int(contract_data.get("deliveryTime", 0))  # 交割时间
-            if delivery_time:
-                delivery_datetime = get_local_datetime(delivery_time)
-                # 过滤过期合约
-                if delivery_datetime <= datetime.now(TZ_INFO):
-                    continue
-                # 交割合约使用交割日期作为name
-                name = str(delivery_datetime.date())
-            else:
-                name = contract_data["symbol"]
             contract = ContractData(
                 symbol=contract_data["symbol"],
                 exchange=CATEGORY_EXCHANGE_MAP[category],
-                name=name,
+                name=contract_data["symbol"],
                 product=product,
-                size=20,  # 合约杠杆
+                size=10,  # 合约杠杆
                 price_tick=float(contract_data["priceFilter"].get("minPrice", contract_data["priceFilter"]["tickSize"])),
                 max_volume=float(contract_data["lotSizeFilter"]["maxOrderQty"]),
                 min_volume=float(contract_data["lotSizeFilter"]["minOrderQty"]),
                 gateway_name=self.gateway_name,
             )
+            delivery_time = int(contract_data.get("deliveryTime", "0"))  # 交割时间
+            if delivery_time:
+                delivery_datetime = get_local_datetime(delivery_time)
+                # 过滤过期合约
+                if delivery_datetime <= datetime.now(TZ_INFO):
+                    continue
+                # 交割合约使用symbol_mark + 交割日期作为name
+                contract.name = get_symbol_mark(contract.vt_symbol) + "_" + str(delivery_datetime.date())
             self.gateway.on_contract(contract)
         self.gateway.write_log(f"{self.gateway_name}，{category.upper()}合约信息查询成功")
     # ----------------------------------------------------------------------------------------------------
@@ -1069,10 +1066,10 @@ class BybitWebsocketTradeApi(WebsocketClient):
         self.start()
     # ----------------------------------------------------------------------------------------------------
     def login(self):
-        """ """
-        #expires = generate_timestamp(20)
-        expires = generate_timestamp(0)
-        msg = f"GET/realtime{int(expires)}"
+        """
+        """
+        expires = int((time() + 30) * 1000)
+        msg = f"GET/realtime{expires}"
         signature = sign(self.secret, msg.encode())
 
         req = {"op": "auth", "args": [self.key, expires, signature]}
@@ -1125,7 +1122,9 @@ class BybitWebsocketTradeApi(WebsocketClient):
         self.gateway.write_log(f"交易接口:{self.gateway_name},Websocket API交易连接断开")
     # ----------------------------------------------------------------------------------------------------
     def on_trade(self, packet):
-        """ """
+        """
+        收到成交回报
+        """
         for trade_data in packet["data"]:
             category = trade_data["category"]
             exchange = CATEGORY_EXCHANGE_MAP[category]
@@ -1147,7 +1146,9 @@ class BybitWebsocketTradeApi(WebsocketClient):
             self.gateway.on_trade(trade)
     # ----------------------------------------------------------------------------------------------------
     def on_order(self, packet):
-        """ """
+        """
+        收到委托单回报
+        """
         for order_data in packet["data"]:
             category = order_data["category"]
             exchange = CATEGORY_EXCHANGE_MAP[category]
@@ -1174,7 +1175,7 @@ class BybitWebsocketTradeApi(WebsocketClient):
         """
         for pos_data in packet["data"]:
             # 通过杠杆区分现货，合约
-            if pos_data["leverage"] == "20":
+            if pos_data["leverage"] == "10":
                 exchange = Exchange.BYBIT
             else:
                 exchange = Exchange.BYBITSPOT
@@ -1213,21 +1214,6 @@ class BybitWebsocketTradeApi(WebsocketClient):
                 )
                 self.gateway.on_position(long_position)
                 self.gateway.on_position(short_position)
-# ----------------------------------------------------------------------------------------------------
-def generate_timestamp(expire_after: float = 30) -> int:
-    """
-    生成一个带有过期时间的时间戳，常用于API请求的身份验证。
-    
-    该函数返回一个以毫秒为单位的时间戳，表示当前时间加上指定的过期时间后的时刻。
-    这个时间戳通常用于API请求中，以确保请求在一定时间内有效。
-    
-    参数:
-        expire_after: float, 过期时间，单位为秒，默认值为30秒。
-    
-    返回:
-        timestamp: int, 以毫秒为单位的时间戳，表示当前时间加上过期时间后的时刻。
-    """
-    return int(time() * 1000 + expire_after * 1000)
 # ----------------------------------------------------------------------------------------------------
 def sign(secret: bytes, data: bytes) -> str:
     """
