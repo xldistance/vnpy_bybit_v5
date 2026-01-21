@@ -102,7 +102,7 @@ INTERVAL_VT2BYBIT = {
     Interval.WEEKLY: "W",
 }
 CATEGORY_EXCHANGE_MAP: Dict[str, Exchange] = {"spot": Exchange.BYBITSPOT, "inverse": Exchange.BYBIT, "linear": Exchange.BYBIT, "option": Exchange.BYBIT}
-
+CATEGORY_PRODUCT_MAP: Dict[str, Product] = {"spot": Product.SPOT, "inverse": Product.FUTURES, "linear":  Product.FUTURES, "option":  Product.OPTION}
 REST_HOST = "https://api.bybit.com"  # 主host  https://api.bybit.com备用host https://api.bytick.com
 SPOT_PUBLIC_WS_HOST = "wss://stream.bybit.com/v5/public/spot"  # 现货主网公共topic地址
 USDT_PUBLIC_WS_HOST = "wss://stream.bybit.com/v5/public/linear"  # usdt,usdc合约主网公共topic地址
@@ -133,8 +133,7 @@ class BybitOneGateway(BaseGateway):
     }
 
     exchanges = [Exchange.BYBIT, Exchange.BYBITSPOT]  # 由main_engine add_gateway调用
-    # 所有合约列表
-    recording_list = GetFilePath.recording_list
+    get_file_path = GetFilePath()
     # ----------------------------------------------------------------------------------------------------
     def __init__(self, event_engine):
         """ """
@@ -149,11 +148,13 @@ class BybitOneGateway(BaseGateway):
 
         self.count: int = 0
         self.query_count: int = 0
+        # 所有合约列表
+        self.recording_list = self.get_file_path.recording_list
         self.recording_list = [vt_symbol for vt_symbol in self.recording_list if is_target_contract(vt_symbol, self.gateway_name)]
         # 历史数据合约列表
         self.history_contracts = copy(self.recording_list)
         # rest查询合约列表
-        self.query_contracts = [vt_symbol for vt_symbol in GetFilePath.all_trading_vt_symbols if is_target_contract(vt_symbol, self.gateway_name)]
+        self.query_contracts = [vt_symbol for vt_symbol in self.get_file_path.all_trading_vt_symbols if is_target_contract(vt_symbol, self.gateway_name)]
         if not self.query_contracts:
             self.query_contracts = copy(self.recording_list)
         # 下载历史数据状态
@@ -312,7 +313,7 @@ class BybitRestApi(RestClient):
         # 确保生成的orderid不发生冲突
         self.order_count: int = 0
         self.order_count_lock: Lock = Lock()
-        self.connect_time: int = 0
+        self.count_datetime: int = 0
         self.time_offset:int = 0        # 本地与服务器的毫秒时间差整数值
     # ----------------------------------------------------------------------------------------------------
     def get_server_time(self):
@@ -321,7 +322,7 @@ class BybitRestApi(RestClient):
         """
         self.add_request(
             "GET",
-            "/v3/public/time",
+            "/v5/market/time",
             callback=self.on_server_time,
         )
     # ----------------------------------------------------------------------------------------------------
@@ -367,7 +368,6 @@ class BybitRestApi(RestClient):
         """
         self.key = key
         self.secret = secret.encode()
-        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
         if server == "REAL":
             self.init(REST_HOST, proxy_host, proxy_port, gateway_name=self.gateway_name)
         else:
@@ -420,11 +420,11 @@ class BybitRestApi(RestClient):
         """
         symbol = extract_vt_symbol(vt_symbol)[0]
         category = self.get_category(vt_symbol)
-        # 只支持统一账户反向合约，普通账户正反向合约
-        if category not in ["linear", "inverse"]:
+        # 只支持统一账户U本位合约
+        if category not in ["linear"]:
             return
         path = "/v5/position/switch-isolated"
-        data = {"category": category, "symbol": symbol, "tradeMode": 0, "buyLeverage": "20", "sellLeverage": "20"}
+        data = {"category": category, "symbol": symbol, "tradeMode": 0, "buyLeverage": "10", "sellLeverage": "10"}
         self.add_request("POST", path, self.on_isolated, data=data, extra={"vt_symbol": vt_symbol})
     # ----------------------------------------------------------------------------------------------------
     def on_isolated(self, data: dict, request: Request):
@@ -464,8 +464,10 @@ class BybitRestApi(RestClient):
         """
         发送委托单
         """
+        self.count_datetime = int(datetime.now().strftime("%Y%m%d%H%M%S"))
+
         category = self.get_category(req.vt_symbol)
-        orderid = req.symbol + "-" + str(self.connect_time + self._new_order_id())
+        orderid = req.symbol + "-" + str(self.count_datetime) + str(self._new_order_id()).rjust(8,"0")
         data = {
             "category": category,
             "symbol": req.symbol,
@@ -588,14 +590,11 @@ class BybitRestApi(RestClient):
         """
         if self.check_error("查询合约", data):
             return
-        category = data["result"]["category"]
-        if category == "option":
-            product = Product.OPTION
-        elif category == "spot":
-            product = Product.SPOT
-        else:
-            product = Product.FUTURES
-        for contract_data in data["result"]["list"]:
+        raw = data["result"]
+        category = raw["category"]
+        product = CATEGORY_PRODUCT_MAP[category]
+
+        for contract_data in raw["list"]:
             contract = ContractData(
                 symbol=contract_data["symbol"],
                 exchange=CATEGORY_EXCHANGE_MAP[category],
@@ -617,6 +616,10 @@ class BybitRestApi(RestClient):
                 contract.name = get_symbol_mark(contract.vt_symbol) + "_" + str(delivery_datetime.date())
             self.gateway.on_contract(contract)
         self.gateway.write_log(f"{self.gateway_name}，{category.upper()}合约信息查询成功")
+        # 翻页游标
+        next_cursor = raw.get("nextPageCursor")
+        if next_cursor:
+            self.add_request("GET", "/v5/market/instruments-info", self.on_query_contract, params={"limit": 500, "status": "Trading", "category": category,"cursor":next_cursor})
     # ----------------------------------------------------------------------------------------------------
     def get_float_value(self, value: str) -> float:
         """
@@ -662,7 +665,7 @@ class BybitRestApi(RestClient):
             return
         accounts_info = list(self.accounts_info.values())
         account_date = accounts_info[-1]["datetime"].date()
-        account_path = str(GetFilePath.ctp_account_path).replace("ctp_account_main", self.gateway.account_file_name)
+        account_path = self.gateway.get_file_path.account_path(self.gateway.account_file_name)
         write_header = not Path(account_path).exists()
         additional_writing = self.account_date and self.account_date != account_date
         self.account_date = account_date
@@ -901,7 +904,6 @@ class BybitWebsocketDataApi(WebsocketClient):
         else:
             # 推送频率100ms对应订阅档位，合约200档推送频率100ms，现货200档推送频率200ms
             depth_level = 100 if is_option else 200
-        
         self.subscribe_topic(f"orderbook.{depth_level}.{req.symbol}", self.on_depth)
     # ----------------------------------------------------------------------------------------------------
     def subscribe_topic(self, topic: str, callback: Callable[[str, dict], Any]):
@@ -1070,7 +1072,7 @@ class BybitWebsocketTradeApi(WebsocketClient):
         """
         expires = int((time() + 30) * 1000)
         msg = f"GET/realtime{expires}"
-        signature = sign(self.secret, msg.encode())
+        signature = hmac.new(self.secret, msg.encode(), hashlib.sha256).hexdigest()
 
         req = {"op": "auth", "args": [self.key, expires, signature]}
         self.send_packet(req)
@@ -1214,9 +1216,3 @@ class BybitWebsocketTradeApi(WebsocketClient):
                 )
                 self.gateway.on_position(long_position)
                 self.gateway.on_position(short_position)
-# ----------------------------------------------------------------------------------------------------
-def sign(secret: bytes, data: bytes) -> str:
-    """
-    secret签名
-    """
-    return hmac.new(secret, data, digestmod=hashlib.sha256).hexdigest()
