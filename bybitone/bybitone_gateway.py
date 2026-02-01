@@ -233,10 +233,10 @@ class BybitOneGateway(BaseGateway):
         """
         轮询查询活动委托单和持仓
         """
-        #self.query_count += 1
-        #if self.query_count < 5:
-            #return
-        #self.query_count = 0
+        self.query_count += 1
+        if self.query_count < 3:
+            return
+        self.query_count = 0
         if self.query_contracts:
             vt_symbol = self.query_contracts.pop(0)
             self.query_order(vt_symbol)
